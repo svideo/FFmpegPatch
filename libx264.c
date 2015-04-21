@@ -28,6 +28,8 @@
 #include "avcodec.h"
 #include "internal.h"
 
+#include "libavutil/time.h"
+
 #if defined(_MSC_VER)
 #define X264_API_IMPORTS 1
 #endif
@@ -38,6 +40,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define INLOOP_MODIFY
+
+typedef struct X264OrgParams {
+    unsigned int inter; 
+    unsigned int intra; 
+    int i_me_range; 
+    int i_subpel_refine;
+    int i_me_method;
+    int i_frame_reference;
+ 
+    int optLevel;
+}X264OrgParams;
 
 typedef struct X264Context {
     AVClass        *class;
@@ -81,6 +96,7 @@ typedef struct X264Context {
     char *stats;
     int nal_hrd;
     char *x264_params;
+    X264OrgParams x264EncSettings;
 } X264Context;
 
 static void X264_log(void *p, int level, const char *fmt, va_list args)
@@ -165,6 +181,9 @@ static int X264_frame(AVCodecContext *ctx, AVPacket *pkt, const AVFrame *frame,
     x264_picture_t pic_out = {0};
     AVFrameSideData *side_data;
 
+    static int tmpCnt = 0;
+    tmpCnt++;
+
     x264_picture_init( &x4->pic );
     x4->pic.img.i_csp   = x4->params.i_csp;
     if (x264_bit_depth > 8)
@@ -226,6 +245,120 @@ static int X264_frame(AVCodecContext *ctx, AVPacket *pkt, const AVFrame *frame,
             x4->params.rc.f_rf_constant_max = x4->crf_max;
             x264_encoder_reconfig(x4->enc, &x4->params);
         }
+
+#ifdef INLOOP_MODIFY
+
+        static int64_t timer_start=0;
+        static int64_t cur_time=0;
+        static int fpsCnt = 0;
+        float fps, t;
+        int frame_number;
+        int changedFlag = 0;
+
+        frame_number = tmpCnt%50;
+
+        if (tmpCnt%50 == 0)
+        {
+
+            if (timer_start == 0)
+            {
+                timer_start = av_gettime();
+            }
+            else
+            {
+                cur_time = av_gettime();
+                t = (cur_time-timer_start) / 1000000.0;
+                fps = 50 / t;
+
+                timer_start = cur_time;
+                
+                if (fps > 27)
+                {
+                    fpsCnt++;
+                }
+                else 
+                {
+                    fpsCnt = 0;
+                }
+            }
+            
+            if (x4->x264EncSettings.optLevel == 0)
+            {
+                x4->x264EncSettings.inter = x4->params.analyse.inter;
+                x4->x264EncSettings.intra = x4->params.analyse.intra;
+                x4->x264EncSettings.i_me_range = x4->params.analyse.i_me_range;
+                x4->x264EncSettings.i_subpel_refine = x4->params.analyse.i_subpel_refine;
+                x4->x264EncSettings.i_me_method = x4->params.analyse.i_me_method;
+                x4->x264EncSettings.i_frame_reference = x4->params.i_frame_reference;
+                
+                x4->x264EncSettings.optLevel = 1;
+            }
+            
+
+            if (fps < 0.01)
+            {
+            }
+            else if (x4->x264EncSettings.optLevel==3 && fps<24)
+            {
+                x4->x264EncSettings.optLevel = 4;
+                changedFlag = 1;
+            }
+            else if (x4->x264EncSettings.optLevel==2 && fps <24.5)
+            {
+                x4->x264EncSettings.optLevel = 3;
+                changedFlag = 1;
+            }
+            else if (x4->x264EncSettings.optLevel==1 && fps<25)
+            {
+                x4->x264EncSettings.optLevel = 2;
+                changedFlag = 1;
+            }
+            else if (x4->x264EncSettings.optLevel>1 && fps > 27 && fpsCnt>3)
+            {
+                x4->x264EncSettings.optLevel -= 1;
+                changedFlag = 1;
+            }
+
+            if (changedFlag == 1)
+            {
+
+printf("\n## optLevel changed to: %d, fps: %f\n", x4->x264EncSettings.optLevel, fps);
+                if (x4->x264EncSettings.optLevel==4)
+                {
+                    x4->params.analyse.inter = 0x0001 | 0x0002;
+                    x4->params.analyse.intra = 0x0001;
+                    x4->params.analyse.i_me_range = 16;
+                    x4->params.analyse.i_subpel_refine = 4;
+                    x4->params.analyse.i_me_method = 1;
+                    x4->params.i_frame_reference = 1;
+
+                    ret = x264_encoder_reconfig(x4->enc, &x4->params);
+                }
+                else if (x4->x264EncSettings.optLevel==3)
+                {
+                    x4->params.analyse.i_subpel_refine = 4;
+                    x4->params.analyse.inter = 0x0001 | 0x0002 | 0x0010;
+                    ret = x264_encoder_reconfig(x4->enc, &x4->params);
+                }
+                else if (x4->x264EncSettings.optLevel==2)
+                {
+                    x4->params.analyse.inter = 0x0001 | 0x0002;
+                    ret = x264_encoder_reconfig(x4->enc, &x4->params);
+                }
+                else if (x4->x264EncSettings.optLevel==1)
+                {
+                    x4->params.analyse.inter = x4->x264EncSettings.inter;
+                    x4->params.analyse.intra = x4->x264EncSettings.intra;
+                    x4->params.analyse.i_me_range = x4->x264EncSettings.i_me_range;
+                    x4->params.analyse.i_subpel_refine = x4->x264EncSettings.i_subpel_refine;
+                    x4->params.analyse.i_me_method = x4->x264EncSettings.i_me_method;
+                    x4->params.i_frame_reference = x4->x264EncSettings.i_frame_reference;
+                    ret = x264_encoder_reconfig(x4->enc, &x4->params);
+                }
+            }
+        }
+
+#endif
 
         side_data = av_frame_get_side_data(frame, AV_FRAME_DATA_STEREO3D);
         if (side_data) {
@@ -446,6 +579,15 @@ static av_cold int X264_init(AVCodecContext *avctx)
         x4->params.i_keyint_max         = avctx->gop_size;
     if (avctx->max_b_frames >= 0)
         x4->params.i_bframe             = avctx->max_b_frames;
+
+    x4->x264EncSettings.inter = 0;
+    x4->x264EncSettings.intra = 0;
+    x4->x264EncSettings.i_me_range = 0;
+    x4->x264EncSettings.i_subpel_refine = 0;
+    x4->x264EncSettings.i_me_method = 0;
+    x4->x264EncSettings.i_frame_reference = 0;            
+    x4->x264EncSettings.optLevel = 0;
+
     if (avctx->scenechange_threshold >= 0)
         x4->params.i_scenecut_threshold = avctx->scenechange_threshold;
     if (avctx->qmin >= 0)
