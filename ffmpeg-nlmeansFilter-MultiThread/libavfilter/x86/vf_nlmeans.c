@@ -38,7 +38,7 @@
 static void buildIntegralImage_SSE(uint32_t* integral_image, int integral_stride,
                                    const uint8_t* current_image, int current_image_stride,
 				   const uint8_t* compare_image, int compare_image_stride,
-				   int  w,int  h,
+				   int  w,int  hStart, int hEnd, 
 				   int dx,int dy)
 {
     const __m128i zero = _mm_set1_epi8(0);
@@ -46,7 +46,7 @@ static void buildIntegralImage_SSE(uint32_t* integral_image, int integral_stride
 
     memset(integral_image -1 -integral_stride, 0, (w+1)*sizeof(uint32_t));
 
-    for (int y=0;y<h;y++) {
+    for (int y=hStart;y<hEnd;y++) {
         const uint8_t* p1 = current_image +  y    *current_image_stride;
         const uint8_t* p2 = compare_image + (y+dy)*compare_image_stride + dx;
 

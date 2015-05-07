@@ -53,6 +53,7 @@
 #include "libavfilter/vf_nlmeans.h"
 
 
+#define EXP_TABSIZE 128
 
 typedef struct
 {
@@ -65,6 +66,15 @@ typedef struct
     uint8_t* mem_start; // start of allocated memory
 } MonoImage;
 
+typedef struct ThreadData {
+    const MonoImage*const* images;
+    struct PixelSum* tmp_data;
+    const uint8_t* compare_image;
+    uint32_t* integral;
+    int compare_image_stride;
+    int dx;
+    int dy;
+} ThreadData;
 
 typedef enum {
     ImageFormat_Mono,
@@ -142,10 +152,6 @@ static void free_color_image(ColorImage* img)
     }
 }
 
-
-
-
-
 typedef struct
 {
     double h_param;
@@ -161,27 +167,33 @@ typedef struct {
     const AVClass *class;
 
     int hsub,vsub;
-
+    int diff_max;
+    int table_size;
+    float weight_fact_table;
     NLMeansParams param;
 
     ColorImage images[MAX_NLMeansImages];
     int        image_available[MAX_NLMeansImages];
-
+    float exptable[EXP_TABSIZE];
     NLMeansFunctions func;
 
 } NLMContext;
 
-
+struct PixelSum
+{
+    float weight_sum;
+    float pixel_sum;
+};
 
 static void buildIntegralImage_scalar(uint32_t* integral_image,   int integral_stride,
 				      const uint8_t* current_image, int current_image_stride,
 				      const uint8_t* compare_image, int compare_image_stride,
-				      int  w,int  h,
+				      int  w,int  hStart, int hEnd,
 				      int dx,int dy)
 {
     memset(integral_image -1 -integral_stride, 0, (w+1)*sizeof(uint32_t));
 
-    for (int y=0;y<h;y++) {
+    for (int y=hStart;y<hEnd;y++) {
         const uint8_t* p1 = current_image +  y    *current_image_stride;
         const uint8_t* p2 = compare_image + (y+dy)*compare_image_stride + dx;
         uint32_t* out = integral_image + y*integral_stride -1;
@@ -206,17 +218,88 @@ static void buildIntegralImage_scalar(uint32_t* integral_image,   int integral_s
     }
 }
 
-
-
-struct PixelSum
+static int filter_slice(AVFilterContext *ctxA, void *arg, int jobnr, int nb_jobs)
 {
-    float weight_sum;
-    float pixel_sum;
-};
+
+    //NLMContext *s = ctx->priv;
+    ThreadData *td  = arg;
+    NLMContext *ctx = ctxA->priv;
+/*
+    const int table_size=EXP_TABSIZE;
+    const float min_weight_in_table = 0.0005;
+    float exptable[EXP_TABSIZE];
+    const int n = (ctx->param.patch_size|1);
+    const float weight_factor = 1.0/n/n / (ctx->param.h_param * ctx->param.h_param);
+    const float stretch = table_size/ (-log(min_weight_in_table));
+    const float weight_fact_table = weight_factor*stretch;
+    const int diff_max = table_size/weight_fact_table;
+    int table_size = ctx->table_size;
+*/
+    const int n = (ctx->param.patch_size|1);
+    float weight_fact_table = ctx->weight_fact_table;
+
+    int diff_max = ctx->diff_max;
+    float *exptable = ctx->exptable;
+
+    const int n_half = (n-1)/2;
+
+    const MonoImage *const* images = td->images;
+    struct PixelSum* const tmp_data = td->tmp_data;
+    const uint8_t* compare_image = td->compare_image;
+    uint32_t* const integral = td->integral;
+    int dx = td->dx;
+    int dy= td->dy;
+    
+    const int h = images[0]->h;
+    const int w = images[0]->w;
+    const int integral_stride = w+2*16;
+
+    int compare_image_stride = td->compare_image_stride;
+
+    int slice_start, slice_end;
+
+    slice_start = ((h-n) *  jobnr   ) / nb_jobs;
+    slice_end   = ((h-n) * (jobnr+1)) / nb_jobs;
+
+//printf("## (%3d), %d, %d\n", jobnr, slice_start, slice_end);
+/*
+    for (int i=0;i<table_size;i++) {
+        exptable[i] = exp(-i/stretch);
+    }
+    exptable[table_size-1]=0;
+*/
+    for (int y=slice_start;y<=slice_end;y++) {
+        const uint32_t* integral_ptr1 = integral+(y  -1)*integral_stride-1;
+        const uint32_t* integral_ptr2 = integral+(y+n-1)*integral_stride-1;
+
+        for (int x=0;x<=w-n;x++) 
+        {
+            const int xc = x+n_half;
+            const int yc = y+n_half;
+
+            // patch difference
+            int diff = (uint32_t)(integral_ptr2[n] - integral_ptr2[0] - integral_ptr1[n] + integral_ptr1[0]);
+
+            // sum pixel with weight
+            if (diff<diff_max) {
+                int diffidx = diff*weight_fact_table;
+
+                //float weight = exp(-diff*weightFact);
+                float weight = exptable[diffidx];
+
+                tmp_data[yc*w+xc].weight_sum += weight;
+                tmp_data[yc*w+xc].pixel_sum  += weight * compare_image[(yc+dy)*compare_image_stride+xc+dx];
+            }
+
+            integral_ptr1++;
+            integral_ptr2++;
+        }
+    }
+    return 0;
+}
 
 
-
-static void NLMeans_mono_multi(uint8_t* out, int out_stride,
+static void NLMeans_mono_multi(AVFilterContext *ctxA, uint8_t* out, int out_stride,
 			       const MonoImage*const* images, int n_images,
 			       const NLMContext* ctx)
 {
@@ -230,6 +313,7 @@ static void NLMeans_mono_multi(uint8_t* out, int out_stride,
     const int r_half = (r-1)/2;
 
 
+    ThreadData td;
     // alloc memory for temporary pixel sums
 
     struct PixelSum* const tmp_data = (struct PixelSum*)calloc(w*h,sizeof(struct PixelSum));
@@ -241,12 +325,9 @@ static void NLMeans_mono_multi(uint8_t* out, int out_stride,
     uint32_t* const integral_mem = (uint32_t*)malloc( integral_stride*(h+1)*sizeof(uint32_t) );
     uint32_t* const integral = integral_mem + integral_stride + 16;
 
-
     // precompute exponential table
-
+/*
     const float weight_factor = 1.0/n/n / (ctx->param.h_param * ctx->param.h_param);
-
-#define EXP_TABSIZE 128
 
     const int table_size=EXP_TABSIZE;
     const float min_weight_in_table = 0.0005;
@@ -261,8 +342,10 @@ static void NLMeans_mono_multi(uint8_t* out, int out_stride,
         exptable[i] = exp(-i/stretch);
     }
     exptable[table_size-1]=0;
-
-
+*/
+    float *exptable = ctx->exptable;
+    int diff_max = ctx->diff_max;
+    float weight_fact_table = ctx->weight_fact_table;
 
     for (int image_idx=0; image_idx<n_images; image_idx++)
     {
@@ -283,7 +366,7 @@ static void NLMeans_mono_multi(uint8_t* out, int out_stride,
                 // special, simple implementation for no shift (no difference -> weight 1)
 
                 if (dx==0 && dy==0 && image_idx==0) {
-#pragma omp parallel for
+//#pragma omp parallel for
                     for (int y=n_half;y<h-n+n_half;y++) {
                         for (int x=n_half;x<w-n+n_half;x++) {
                             tmp_data[y*w+x].weight_sum += 1;
@@ -300,9 +383,9 @@ static void NLMeans_mono_multi(uint8_t* out, int out_stride,
                 ctx->func.buildIntegralImage(integral,integral_stride,
                                              current_image, current_image_stride,
                                              compare_image, compare_image_stride,
-                                             w,h, dx,dy);
-
-#pragma omp parallel for
+                                             w,0, h, dx,dy);
+#if 0
+//#pragma omp parallel for
                 for (int y=0;y<=h-n;y++) {
                     const uint32_t* integral_ptr1 = integral+(y  -1)*integral_stride-1;
                     const uint32_t* integral_ptr2 = integral+(y+n-1)*integral_stride-1;
@@ -332,6 +415,19 @@ static void NLMeans_mono_multi(uint8_t* out, int out_stride,
                         integral_ptr2++;
                     }
                 }
+#endif
+
+                td.images = images;
+                td.tmp_data = tmp_data;
+                td.compare_image = compare_image;
+                td.integral = integral;
+                td.compare_image_stride = compare_image_stride;
+                td.dx = dx;
+                td.dy = dy;
+
+//                ctxA->internal->execute(ctxA, filter_slice, &td, NULL, FFMIN(h, ctxA->graph->nb_threads));
+                ctxA->graph->internal->thread_execute(ctxA, filter_slice, &td, NULL, FFMIN(h, ctxA->graph->nb_threads));
+
             }
     }
 
@@ -366,7 +462,7 @@ static void NLMeans_mono_multi(uint8_t* out, int out_stride,
 }
 
 
-static void NLMeans_color_auto(uint8_t** out, int* out_stride,
+static void NLMeans_color_auto(AVFilterContext *ctxA, uint8_t** out, int* out_stride,
 			       const ColorImage* img, // function takes ownership
 			       NLMContext* ctx)
 {
@@ -399,7 +495,7 @@ static void NLMeans_color_auto(uint8_t** out, int* out_stride,
                 images[i] = &ctx->images[i].plane[c];
             }
 
-            NLMeans_mono_multi(out[c], out_stride[c],
+            NLMeans_mono_multi(ctxA, out[c], out_stride[c],
                                images, i, ctx);
         }
 }
@@ -409,11 +505,28 @@ static void NLMeans_color_auto(uint8_t** out, int* out_stride,
 static av_cold int init(AVFilterContext *ctx)
 {
     NLMContext *nlm = ctx->priv;
+    float min_weight_in_table;
+    int n;
+    float weight_factor;
+    float stretch;
 
     for (int i=0;i<MAX_NLMeansImages;i++) {
         nlm->image_available[i] = 0;
     }
 
+    nlm->table_size=EXP_TABSIZE;
+    min_weight_in_table = 0.0005;
+    n = (nlm->param.patch_size|1);
+    weight_factor = 1.0/n/n / (nlm->param.h_param * nlm->param.h_param);
+    stretch = nlm->table_size/ (-log(min_weight_in_table));
+    nlm->weight_fact_table = weight_factor*stretch;
+	
+    nlm->diff_max = nlm->table_size/nlm->weight_fact_table;
+
+    for (int i=0;i<nlm->table_size;i++) {
+        nlm->exptable[i] = exp(-i/stretch);
+    }
+    nlm->exptable[nlm->table_size-1]=0;
 
     nlm->func.buildIntegralImage = buildIntegralImage_scalar;
 
@@ -475,7 +588,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     NLMContext *nlm = inlink->dst->priv;
     AVFilterLink *outlink = inlink->dst->outputs[0];
-
+    AVFilterContext *ctxA = inlink->dst;
     ColorImage bordered_image;
 
     AVFrame *out;
@@ -508,7 +621,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                                          w,h,border);
     }
 
-    NLMeans_color_auto(out->data, out->linesize,
+    NLMeans_color_auto(ctxA, out->data, out->linesize,
 		       &bordered_image,
 		       nlm);
 

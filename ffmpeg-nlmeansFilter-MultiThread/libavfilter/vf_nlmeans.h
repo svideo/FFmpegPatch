@@ -29,7 +29,7 @@ typedef struct
     void (*buildIntegralImage)(uint32_t* integral,   int integral_stride32,
                                const uint8_t* currimage, int currstride,
                                const uint8_t* image, int stride,
-                               int  w,int  h,
+                               int  w,int  hStart, int hEnd,
                                int dx,int dy);
 } NLMeansFunctions;
 
